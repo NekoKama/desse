@@ -6,6 +6,7 @@ from emu.Util import *
 from emu.GhostManager import *
 from emu.MessageManager import *
 from emu.PlayerManager import *
+from emu.ReplayManager import *
 from emu.SOSManager import *
 
 logging.basicConfig(level=logging.DEBUG,
@@ -17,35 +18,12 @@ stream_handler.setLevel(logging.INFO)
 
 logging.getLogger("").addHandler(stream_handler)
 
-class ReplayHeader(object):
-    def __init__(self):
-        pass
-        
-    def create(self, sio):
-        ghostID = sio.read(4)
-        if len(ghostID) != 4:
-            return False
-            
-        self.ghostID = struct.unpack("<I", ghostID)[0]
-        
-        self.name = readcstring(sio)
-        self.data = sio.read(40)
-        
-        self.blockID, self.posx, self.posy, self.posz, self.angx, self.angy, self.angz, self.messageID, self.mainMsgID, self.addMsgCateID = struct.unpack("<iffffffIII", self.data)
-        
-        return True
-        
-    def to_bin(self):
-        res = struct.pack("<I", self.ghostID)
-        res += self.name + "\x00"
-        res += self.data
-        return res
-
 class ImpSock(object):
     def __init__(self, sc, name):
         self.sc = sc
         self.name = name
         self.recvdata = ""
+        self.sc.settimeout(10)
         
     def recv(self, sz):
         data = self.sc.recv(sz)
@@ -104,38 +82,9 @@ class Server(object):
         self.MessageManager = MessageManager()
         self.SOSManager = SOSManager()
         self.PlayerManager = PlayerManager()
-        self.replayheaders = {}
-        self.replaydata = {}
+        self.ReplayManager = ReplayManager()
         self.players = {}
         
-        f = open("replayheaders.bin", "rb")
-        while True:
-            header = ReplayHeader()
-            res = header.create(f)
-            if not res:
-                break
-                
-            if header.blockID not in self.replayheaders:
-                self.replayheaders[header.blockID] = []
-                
-            if (header.messageID, header.mainMsgID, header.addMsgCateID) != (0, 0, 0):
-                self.replayheaders[header.blockID].append(header)
-                
-        logging.info("Finished reading replay headers")
-        
-        f = open("replaydata.bin", "rb")
-        while True:
-            ghostID = f.read(4)
-            if len(ghostID) != 4:
-                break
-            ghostID = struct.unpack("<I", ghostID)[0]
-            
-            data = readcstring(f)
-            
-            self.replaydata[ghostID] = data
-            
-        logging.info("Finished reading replay data")
-                
     def run(self):
         servers = []
         for port in (SERVER_PORT_BOOTSTRAP, SERVER_PORT_US, SERVER_PORT_EU, SERVER_PORT_JP):
@@ -186,7 +135,7 @@ class Server(object):
                     logging.debug("got connect from %r to %r player %r request %r" % (client_addr, serverport, characterID, req))
                     
                     if clientcmd == "login.spd":
-                        cmd, data = self.handle_login(params)
+                        cmd, data = self.handle_login(params, serverport)
                     elif clientcmd == "initializeCharacter.spd":
                         cmd, data, characterID = self.PlayerManager.handle_initializeCharacter(params)
                         self.players[client_ip] = characterID
@@ -216,16 +165,16 @@ class Server(object):
                         cmd, data = self.MessageManager.handle_deleteBloodMessage(params)
                         
                     elif clientcmd == "getReplayList.spd":
-                        cmd, data = self.handle_getReplayList(cdata)
+                        cmd, data = self.ReplayManager.handle_getReplayList(params)
                     elif clientcmd == "getReplayData.spd":
-                        cmd, data = self.handle_getReplayData(cdata)
+                        cmd, data = self.ReplayManager.handle_getReplayData(params)
                     elif clientcmd == "addReplayData.spd":
-                        cmd, data = 0x1d, "01000000".decode("hex")
+                        cmd, data = self.ReplayManager.handle_addReplayData(params)
                         
                     elif clientcmd == "getWanderingGhost.spd":
                         cmd, data = self.GhostManager.handle_getWanderingGhost(params)
                     elif clientcmd == "setWanderingGhost.spd":
-                        cmd, data = self.GhostManager.handle_setWanderingGhost(params)
+                        cmd, data = self.GhostManager.handle_setWanderingGhost(params, serverport)
                         
                     elif clientcmd == "getSosData.spd":
                         cmd, data = self.SOSManager.handle_getSosData(params, serverport)
@@ -264,14 +213,18 @@ class Server(object):
                 tb = traceback.format_exc()
                 logging.error("Exception! Traceback:\n%s" % tb)
             
-    def handle_login(self, params):
+    def handle_login(self, params, serverport):
         motd  = "Welcome to ymgve's test server!\r\n"
-        motd += "This is a temporary server, it will eventually be shut\r\n"
-        motd += "down and its source code published.\r\n"
+        motd += "This is a temporary server, it will\r\n"
+        motd += "eventually be shut down.\r\n\r\n"
+        motd += "source code:\r\n"
+        motd += "https://github.com/ymgve/desse\r\n"
+        
 
-        total, blockslist = self.GhostManager.get_current_players()
-        motd2  = "Current players online: %d\r\n" % total
-        motd2 += "Popular areas:\r\n"
+        regiontotal, blockslist = self.GhostManager.get_current_players(serverport)
+        motd2  = "Current players online: %d\r\n" % sum(regiontotal.values())
+        motd2 += "US %d  EU %d  JP %d\r\n" % (regiontotal[SERVER_PORT_US], regiontotal[SERVER_PORT_EU], regiontotal[SERVER_PORT_JP])
+        motd2 += "Popular areas in your region:\r\n"
         for count, blockID in blockslist[::-1][0:5]:
              motd2 += "%4d %s\r\n" % (count, blocknames[blockID])
              
@@ -293,27 +246,6 @@ class Server(object):
         # 0x02 - online service has been terminated
 
         return 0x22, "\x00\x00\x00"
-        
-    def handle_getReplayList(self, cdata):
-        params = get_params(cdata)
-        blockID = make_signed(int(params["blockID"]))
-        replayNum = int(params["replayNum"])
-        
-        data = struct.pack("<I", replayNum)
-        for i in xrange(replayNum):
-            header = random.choice(self.replayheaders[blockID])
-            data += header.to_bin()
-            
-        return 0x1f, data
-        
-    def handle_getReplayData(self, cdata):
-        params = get_params(cdata)
-        ghostID = int(params["ghostID"])
-        
-        ghostdata = self.replaydata[ghostID]
-        data = struct.pack("<II", ghostID, len(ghostdata)) + ghostdata
-            
-        return 0x1e, data
         
     def prepare_response(self, cmd, data):
         # The official servers were REALLY inconsistent with the data length field

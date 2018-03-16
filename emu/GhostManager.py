@@ -1,4 +1,4 @@
-import base64, cStringIO, logging, random, struct, time, traceback, zlib
+import base64, cStringIO, logging, random, struct, time
 
 from emu.Util import *
 
@@ -43,13 +43,13 @@ class GhostManager(object):
 
         return 0x11, res
         
-    def handle_setWanderingGhost(self, params):
+    def handle_setWanderingGhost(self, params, serverport):
         characterID = params["characterID"]
         ghostBlockID = make_signed(int(params["ghostBlockID"]))
         replayData = decode_broken_base64(params["replayData"])
         
         # this is not strictly necessary, but it might help weed out bad ghosts that might otherwise crash the game
-        if self.validate_replayData(replayData):
+        if validate_replayData(replayData):
             ghost = Ghost(characterID, ghostBlockID, replayData)
             
             if characterID in self.ghosts:
@@ -60,44 +60,27 @@ class GhostManager(object):
                 logging.debug("Player %r spawned into %s" % (characterID, blocknames[ghostBlockID]))
                 
             self.ghosts[characterID] = ghost
+            self.ghosts[characterID].serverport = serverport
         
         return 0x17, "\x01"
     
-    def validate_replayData(self, replayData):
-        try:
-            z = zlib.decompressobj()
-            data = z.decompress(replayData)
-            assert z.unconsumed_tail == ""
-            
-            sio = cStringIO.StringIO(data)
-            
-            poscount, num1, num2 = struct.unpack(">III", sio.read(12))
-            for i in xrange(poscount):
-                posx, posy, posz, angx, angy, angz, num3, num4 = struct.unpack(">ffffffII", sio.read(32))
-                
-            unknowns = struct.unpack(">iiiiiiiiiiiiiiiiiiii", sio.read(4 * 20))
-            playername = sio.read(34).decode("utf-16be").rstrip("\x00")
-            assert sio.read() == ""
-            
-            return True
-            
-        except:
-            tb = traceback.format_exc()
-            logging.warning("bad ghost data %r %r\n%s" % (replayData, data, tb))
-            return False
-
-    def get_current_players(self):
+    def get_current_players(self, serverport):
         blocks = {}
-        total = 0
+        regiontotal = {}
+        regiontotal[SERVER_PORT_US] = 0
+        regiontotal[SERVER_PORT_EU] = 0
+        regiontotal[SERVER_PORT_JP] = 0
         
         self.kill_stale_ghosts()
         
         for ghost in self.ghosts.values():
-            if ghost.ghostBlockID not in blocks:
-                blocks[ghost.ghostBlockID] = 0
-            blocks[ghost.ghostBlockID] += 1
-            total += 1
+            regiontotal[ghost.serverport] += 1
+            
+            if ghost.serverport == serverport:
+                if ghost.ghostBlockID not in blocks:
+                    blocks[ghost.ghostBlockID] = 0
+                blocks[ghost.ghostBlockID] += 1
                 
         blockslist = sorted((v, k) for (k, v) in blocks.items())
-        logging.debug("Total players %d %r" % (total, blockslist))
-        return total, blockslist
+        logging.debug("Total players %r %r" % (regiontotal, blockslist))
+        return regiontotal, blockslist
